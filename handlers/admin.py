@@ -8,6 +8,7 @@ def is_admin(user: dict) -> bool:
     return user.get('role') == 'ADMIN'
 
 @router.message(Command("whitelist"))
+@router.message(F.text == "👥 Whitelist")
 async def cmd_whitelist(message: types.Message, current_user: dict):
     if not is_admin(current_user):
         await message.answer("⚠️ Perintah ini khusus untuk Admin.")

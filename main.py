@@ -4,6 +4,7 @@ import sys
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.enums import ParseMode
+from aiogram.types import BotCommand
 
 from config import BOT_TOKEN
 from database.db import init_db
@@ -55,6 +56,18 @@ async def main():
 
     # Start SLA Reminders
     scheduler = start_reminder_scheduler(bot)
+
+    # Register Bot Menu Commands in Telegram UI
+    await bot.set_my_commands([
+        BotCommand(command="start", description="🏠 Menu Utama"),
+        BotCommand(command="open", description="📋 Antrian Tiket Aktif"),
+        BotCommand(command="rekap", description="📊 Rekap Laporan WhatsApp"),
+        BotCommand(command="cari", description="🔍 Cari Tiket (No Tiket/CRT/Nama)"),
+        BotCommand(command="whitelist", description="👥 Kelola Whitelist User"),
+        BotCommand(command="help", description="❓ Panduan Format & Alur"),
+        BotCommand(command="me", description="👤 Profil Saya"),
+        BotCommand(command="cancel", description="🚫 Batalkan Operasi")
+    ])
 
     logger.info("Bot Fiberstar Pekanbaru is starting polling...")
     try:

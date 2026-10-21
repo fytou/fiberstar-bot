@@ -29,6 +29,7 @@ def make_report_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 @router.message(Command("rekap"))
+@router.message(F.text == "📊 Rekap WhatsApp")
 async def cmd_rekap(message: types.Message):
     # Check if date was provided directly, e.g. /rekap 20/10/2026 or /rekap 2026-10-20
     args = message.text.split(maxsplit=1)

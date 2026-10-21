@@ -30,6 +30,7 @@ def make_open_list_keyboard(tickets: list[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 @router.message(Command("open"))
+@router.message(F.text == "📋 Antrian Tiket")
 async def cmd_open(message: types.Message):
     active_tickets = await get_open_tickets()
     if not active_tickets:
@@ -90,6 +91,16 @@ async def cmd_search(message: types.Message):
         ])
 
     await message.answer("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@router.message(F.text == "🔍 Cari Tiket")
+async def cmd_search_prompt(message: types.Message):
+    await message.answer(
+        "🔍 *Pencarian Tiket:*\n"
+        "Silakan ketik perintah pencarian:\n"
+        "`/cari <nomor_tiket / nomor_crt / nama_pelanggan>`\n\n"
+        "Contoh: `/cari CRT1000` atau `/cari Budi`",
+        parse_mode="Markdown"
+    )
 
 @router.message(F.text.regexp(r"^/detail_(\d+)$"))
 async def cmd_detail_shortcut(message: types.Message):
