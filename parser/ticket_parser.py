@@ -25,6 +25,7 @@ class ParsedTicket:
         self.reported_at: Optional[str] = None
         self.fu_at: Optional[datetime] = None
         self.warranty_program: Optional[str] = None
+        self.vendor: str = "DELTA"
         self.status: str = "OPEN"
         self.closing_note: Optional[str] = None
         self.closed_at: Optional[str] = None
@@ -47,6 +48,7 @@ class ParsedTicket:
             "issue_detail": self.issue_detail,
             "rx_power_dbm": self.rx_power_dbm,
             "warranty_program": self.warranty_program,
+            "vendor": self.vendor,
             "status": self.status,
             "closing_note": self.closing_note,
             "reported_at": self.reported_at,
@@ -236,9 +238,16 @@ def parse_single_ticket_block(block: str, header_note: Optional[str] = None) -> 
     if warranty_match:
         prog = warranty_match.group(1).upper()
         pt.warranty_program = f"Garansi {prog.lower()}"
+        pt.vendor = prog
     elif re.search(r'\bGaransi\s+(delta|ineo)\b', block, re.IGNORECASE):
         w_match = re.search(r'\bGaransi\s+(delta|ineo)\b', block, re.IGNORECASE)
-        pt.warranty_program = f"Garansi {w_match.group(1).lower()}"
+        prog = w_match.group(1).upper()
+        pt.warranty_program = f"Garansi {prog.lower()}"
+        pt.vendor = prog
+    elif 'ineo' in block.lower():
+        pt.vendor = 'INEO'
+    else:
+        pt.vendor = 'DELTA'
 
     # 13. Validation of mandatory fields: ticket_no, crt_number, customer_name, issue_type
     if not pt.ticket_no:

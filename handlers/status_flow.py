@@ -6,7 +6,9 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from database.queries import (
     ALLOWED_TRANSITIONS,
     get_ticket_by_id,
-    update_ticket_status
+    update_ticket_status,
+    transfer_ticket_to_ineo,
+    get_team
 )
 from services.reply_service import generate_closed_reply_text
 
@@ -16,7 +18,7 @@ class StatusFlowStates(StatesGroup):
     waiting_for_custom_note = State()
     waiting_for_reopen_reason = State()
 
-def make_status_change_keyboard(ticket_id: int, current_status: str) -> InlineKeyboardMarkup:
+def make_status_change_keyboard(ticket_id: int, current_status: str, ticket_vendor: str = 'DELTA', user_role: str = 'TEKNISI') -> InlineKeyboardMarkup:
     allowed = ALLOWED_TRANSITIONS.get(current_status, [])
     buttons = []
 
@@ -39,6 +41,15 @@ def make_status_change_keyboard(ticket_id: int, current_status: str) -> InlineKe
             row = []
     if row:
         buttons.append(row)
+
+    # SPECIAL CASE: If ticket is currently with DELTA, add "Oper ke INEO (ODP Lost)" button!
+    if ticket_vendor == 'DELTA' and current_status not in ('CLOSED', 'CANCELLED'):
+        buttons.append([
+            InlineKeyboardButton(
+                text="🔄 Oper ke INEO (ODP Lost)",
+                callback_data=f"transfer_odp:{ticket_id}"
+            )
+        ])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -66,9 +77,55 @@ def make_quick_note_keyboard(ticket_id: int, to_status: str) -> InlineKeyboardMa
     ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+# --- ODP LOST TRANSFER HANDLER (DELTA -> INEO) ---
+
+@router.callback_query(F.data.startswith("transfer_odp:"))
+async def handle_transfer_odp_callback(callback: types.CallbackQuery, current_user: dict):
+    ticket_id = int(callback.data.split(":")[1])
+    ticket = await get_ticket_by_id(ticket_id)
+    if not ticket:
+        await callback.answer("Tiket tidak ditemukan.", show_alert=True)
+        return
+
+    user_id = current_user['user_id']
+    user_name = current_user.get('full_name', 'Teknisi DELTA')
+
+    # Execute transfer to INEO
+    ok, msg, updated = await transfer_ticket_to_ineo(ticket_id, user_id, reason="ODP Lost")
+    if not ok:
+        await callback.answer(msg, show_alert=True)
+        return
+
+    # Broadcast to team group if available
+    team = await get_team()
+    if team and team.get('report_chat_id'):
+        group_msg = (
+            f"📢 *PENGALIHAN TIKET (ODP LOST)*\n\n"
+            f"• *No Tiket:* `{updated['ticket_no']}`\n"
+            f"• *Pelanggan:* {updated['customer_name']}\n"
+            f"• *Pengalih:* {user_name} (DELTA)\n"
+            f"• *Vendor Baru:* 🔵 *INEO*\n"
+            f"• *Alasan:* ODP Lost (Ditangani khusus oleh INEO)\n\n"
+            f"👉 Mohon teknisi INEO segera mengecek antrian `/open`."
+        )
+        try:
+            await callback.bot.send_message(chat_id=team['report_chat_id'], text=group_msg, parse_mode="Markdown")
+        except Exception:
+            pass
+
+    confirm_text = (
+        f"🔄 *TIKET BERHASIL DIOPER KE TEKNISI INEO!*\n\n"
+        f"• *No Tiket:* `{updated['ticket_no']}`\n"
+        f"• *Pelanggan:* {updated['customer_name']}\n"
+        f"• *Alasan:* Kendala ODP Lost\n"
+        f"• *Status:* *OPEN* (Antrian INEO)\n\n"
+        f"✅ Tiket ini sudah resmi dipindahkan ke antrian teknisi *INEO* dan dikeluarkan dari daftar antrian DELTA."
+    )
+    await callback.message.edit_text(confirm_text, parse_mode="Markdown")
+    await callback.answer("Tiket berhasil dialihkan ke INEO!")
+
 @router.callback_query(F.data.startswith("s:"))
-async def handle_status_change_request(callback: types.CallbackQuery, state: FSMContext):
-    # format: s:<ticket_id>:<to_status>
+async def handle_status_change_request(callback: types.CallbackQuery, state: FSMContext, current_user: dict):
     parts = callback.data.split(":")
     ticket_id = int(parts[1])
     to_status = parts[2]
@@ -107,7 +164,6 @@ async def handle_status_change_request(callback: types.CallbackQuery, state: FSM
         return
 
     # Otherwise (e.g. ON_PROGRESS, RESCHEDULED), can update directly
-    from database.queries import update_ticket_status
     user_id = callback.from_user.id
     success, msg, updated = await update_ticket_status(ticket_id, user_id, to_status, note=None)
 
@@ -115,18 +171,23 @@ async def handle_status_change_request(callback: types.CallbackQuery, state: FSM
         await callback.message.edit_text(
             f"✅ *Status Tiket Berhasil Diperbarui!*\n\n"
             f"• *No Tiket:* `{updated['ticket_no']}`\n"
+            f"• *Vendor:* *{updated['vendor']}*\n"
             f"• *Status Baru:* *{to_status}*\n"
             f"• *Pelanggan:* {updated['customer_name']}\n",
             parse_mode="Markdown",
-            reply_markup=make_status_change_keyboard(ticket_id, to_status)
+            reply_markup=make_status_change_keyboard(
+                ticket_id,
+                to_status,
+                ticket_vendor=updated['vendor'],
+                user_role=current_user.get('role', 'TEKNISI')
+            )
         )
         await callback.answer("Status berhasil diubah!")
     else:
         await callback.answer(msg, show_alert=True)
 
 @router.callback_query(F.data.startswith("sn:"))
-async def handle_status_note_selection(callback: types.CallbackQuery, state: FSMContext):
-    # format: sn:<ticket_id>:<to_status>:<shortcut_code>
+async def handle_status_note_selection(callback: types.CallbackQuery, state: FSMContext, current_user: dict):
     parts = callback.data.split(":")
     ticket_id = int(parts[1])
     to_status = parts[2]
@@ -156,7 +217,6 @@ async def handle_status_note_selection(callback: types.CallbackQuery, state: FSM
 
     if success:
         reply_extra = ""
-        # FR-09: Generator teks balasan jika tiket CLOSED
         if to_status == 'CLOSED':
             reply_text = generate_closed_reply_text(note, updated.get('original_text'))
             reply_extra = (
@@ -166,8 +226,9 @@ async def handle_status_note_selection(callback: types.CallbackQuery, state: FSM
             )
 
         await callback.message.edit_text(
-            f"✅ *Tiket Berhasil Diselesaikan!*\n\n"
+            f"✅ *Tiket Berhasil Diupdate!*\n\n"
             f"• *No Tiket:* `{updated['ticket_no']}`\n"
+            f"• *Vendor:* *{updated['vendor']}*\n"
             f"• *Status:* *{to_status}*\n"
             f"• *Catatan:* _{note}_\n"
             f"• *Hasil SLA:* `{updated.get('sla_result') or 'IN_SLA'}`\n"
@@ -179,12 +240,27 @@ async def handle_status_note_selection(callback: types.CallbackQuery, state: FSM
         await callback.answer(msg, show_alert=True)
 
 @router.message(StatusFlowStates.waiting_for_custom_note)
-async def handle_custom_note_input(message: types.Message, state: FSMContext):
+async def handle_custom_note_input(message: types.Message, state: FSMContext, current_user: dict):
     data = await state.get_data()
     ticket_id = data['ticket_id']
     to_status = data['to_status']
     note = message.text.strip()
     await state.clear()
+
+    ticket = await get_ticket_by_id(ticket_id)
+    # Check if DELTA ticket and note mentions ODP Lost
+    if ticket and ticket['vendor'] == 'DELTA' and 'odp' in note.lower() and 'lost' in note.lower():
+        user_id = message.from_user.id
+        ok, msg, updated = await transfer_ticket_to_ineo(ticket_id, user_id, reason=note)
+        if ok:
+            await message.answer(
+                f"🔄 *Catatan ODP Lost Terdeteksi!*\n\n"
+                f"Tiket `{updated['ticket_no']}` telah *otomatis dialihkan ke Vendor INEO* sesuai aturan sistem (penanganan ODP Lost dilakukan oleh INEO).\n"
+                f"• Status: *OPEN* di antrian INEO\n"
+                f"• Catatan: _{note}_",
+                parse_mode="Markdown"
+            )
+            return
 
     user_id = message.from_user.id
     success, msg, updated = await update_ticket_status(ticket_id, user_id, to_status, note=note)
@@ -202,6 +278,7 @@ async def handle_custom_note_input(message: types.Message, state: FSMContext):
         await message.answer(
             f"✅ *Status Tiket Berhasil Diperbarui!*\n\n"
             f"• *No Tiket:* `{updated['ticket_no']}`\n"
+            f"• *Vendor:* *{updated['vendor']}*\n"
             f"• *Status:* *{to_status}*\n"
             f"• *Catatan:* _{note}_\n"
             f"• *Hasil SLA:* `{updated.get('sla_result') or 'IN_SLA'}`\n"

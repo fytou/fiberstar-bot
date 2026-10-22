@@ -17,15 +17,16 @@ class WhitelistMiddleware(BaseMiddleware):
 
         user_id = user.id
 
-        # Auto-whitelist configured bootstrap admins
+        # Auto-whitelist configured bootstrap admins as SUPERADMIN
         if user_id in ADMIN_IDS:
             db_user = await get_user(user_id)
-            if not db_user or db_user['role'] != 'ADMIN' or not db_user['is_active']:
+            if not db_user or db_user['role'] != 'SUPERADMIN' or not db_user['is_active']:
                 db_user = await upsert_user(
                     user_id=user_id,
                     username=user.username or "",
                     full_name=user.full_name or f"User {user_id}",
-                    role='ADMIN',
+                    role='SUPERADMIN',
+                    vendor='ALL',
                     is_active=1
                 )
             data["current_user"] = db_user

@@ -29,7 +29,15 @@ async def get_user(user_id: int) -> Optional[dict]:
         row = await cur.fetchone()
         return dict(row) if row else None
 
-async def upsert_user(user_id: int, username: str, full_name: str, role: str = 'TEKNISI', is_active: int = 1, team_name: str = 'Pekanbaru') -> dict:
+async def upsert_user(
+    user_id: int,
+    username: str,
+    full_name: str,
+    role: str = 'TEKNISI',
+    vendor: str = 'ALL',
+    is_active: int = 1,
+    team_name: str = 'Pekanbaru'
+) -> dict:
     async with get_db() as conn:
         cur = await conn.execute("SELECT team_id FROM teams WHERE name = ?", (team_name,))
         team_row = await cur.fetchone()
@@ -39,13 +47,20 @@ async def upsert_user(user_id: int, username: str, full_name: str, role: str = '
         existing = await cur.fetchone()
         if existing:
             await conn.execute(
-                "UPDATE users SET username = ?, full_name = ?, role = ?, is_active = ? WHERE user_id = ?",
-                (username, full_name, role, is_active, user_id)
+                """
+                UPDATE users
+                SET username = ?, full_name = ?, role = ?, vendor = ?, is_active = ?
+                WHERE user_id = ?
+                """,
+                (username, full_name, role, vendor, is_active, user_id)
             )
         else:
             await conn.execute(
-                "INSERT INTO users (user_id, team_id, username, full_name, role, is_active) VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, team_id, username, full_name, role, is_active)
+                """
+                INSERT INTO users (user_id, team_id, username, full_name, role, vendor, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, team_id, username, full_name, role, vendor, is_active)
             )
         await conn.commit()
         return await get_user(user_id)
@@ -56,9 +71,21 @@ async def set_user_active(user_id: int, is_active: bool) -> bool:
         await conn.commit()
         return cur.rowcount > 0
 
+async def set_user_role(user_id: int, role: str) -> bool:
+    async with get_db() as conn:
+        cur = await conn.execute("UPDATE users SET role = ? WHERE user_id = ?", (role, user_id))
+        await conn.commit()
+        return cur.rowcount > 0
+
+async def set_user_vendor(user_id: int, vendor: str) -> bool:
+    async with get_db() as conn:
+        cur = await conn.execute("UPDATE users SET vendor = ? WHERE user_id = ?", (vendor, user_id))
+        await conn.commit()
+        return cur.rowcount > 0
+
 async def list_users() -> List[dict]:
     async with get_db() as conn:
-        cur = await conn.execute("SELECT * FROM users ORDER BY role, full_name")
+        cur = await conn.execute("SELECT * FROM users ORDER BY role, vendor, full_name")
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
@@ -96,7 +123,7 @@ async def get_active_tickets_by_crt(crt_number: str) -> List[dict]:
     async with get_db() as conn:
         cur = await conn.execute(
             """
-            SELECT ticket_id, ticket_no, crt_number, status, fu_at, sla_deadline
+            SELECT ticket_id, ticket_no, crt_number, vendor, status, fu_at, sla_deadline
             FROM tickets
             WHERE crt_number = ? AND status NOT IN ('CLOSED', 'CANCELLED')
             """,
@@ -143,8 +170,12 @@ async def insert_ticket(
         node_id = cur.lastrowid
 
         status = ticket_data.get('status', 'OPEN')
-        fu_at = ticket_data['fu_at'] # ISO format string or datetime
-        sla_deadline = ticket_data['sla_deadline'] # ISO format string or datetime
+        vendor = ticket_data.get('vendor', 'DELTA').upper()
+        if vendor not in ('DELTA', 'INEO'):
+            vendor = 'DELTA'
+
+        fu_at = ticket_data['fu_at']
+        sla_deadline = ticket_data['sla_deadline']
         closing_note = ticket_data.get('closing_note')
         closed_at = ticket_data.get('closed_at')
         sla_result = ticket_data.get('sla_result')
@@ -153,11 +184,11 @@ async def insert_ticket(
         cur = await conn.execute(
             """
             INSERT INTO tickets (
-                ticket_no, crt_number, customer_id, node_id, raw_id,
+                ticket_no, crt_number, customer_id, node_id, raw_id, vendor,
                 issue_type, issue_detail, rx_power_dbm, warranty_program,
                 status, reported_at, fu_at, sla_deadline, sla_result,
                 closed_at, closing_note
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 ticket_data['ticket_no'],
@@ -165,6 +196,7 @@ async def insert_ticket(
                 customer_id,
                 node_id,
                 raw_id,
+                vendor,
                 ticket_data['issue_type'],
                 ticket_data.get('issue_detail'),
                 ticket_data.get('rx_power_dbm'),
@@ -186,7 +218,7 @@ async def insert_ticket(
             INSERT INTO ticket_events (ticket_id, user_id, from_status, to_status, note)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (ticket_id, user_id, None, status, closing_note or "Tiket diinput")
+            (ticket_id, user_id, None, status, closing_note or f"Tiket masuk (Vendor {vendor})")
         )
 
         await conn.commit()
@@ -247,7 +279,6 @@ async def update_ticket_status(
         if to_status in ('CLOSED', 'CANCELLED'):
             closed_at = now_str
             if to_status == 'CLOSED':
-                # Parse SLA deadline
                 deadline = datetime.fromisoformat(ticket['sla_deadline'])
                 if deadline.tzinfo is None:
                     deadline = deadline.replace(tzinfo=timezone.utc)
@@ -286,11 +317,51 @@ async def update_ticket_status(
     updated = await get_ticket_by_id(ticket_id)
     return True, f"Status tiket {updated['ticket_no']} berhasil diubah ke {to_status}.", updated
 
+async def transfer_ticket_to_ineo(ticket_id: int, user_id: int, reason: str = "ODP Lost") -> tuple[bool, str, Optional[dict]]:
+    """
+    Transfers ticket from DELTA to INEO vendor due to ODP Lost.
+    """
+    async with get_db() as conn:
+        cur = await conn.execute("SELECT * FROM tickets WHERE ticket_id = ?", (ticket_id,))
+        ticket = await cur.fetchone()
+        if not ticket:
+            return False, "Tiket tidak ditemukan.", None
+
+        prev_vendor = ticket['vendor']
+        prev_status = ticket['status']
+
+        await conn.execute(
+            """
+            UPDATE tickets
+            SET vendor = 'INEO',
+                transferred_from = ?,
+                transfer_reason = ?,
+                status = 'OPEN',
+                closing_note = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE ticket_id = ?
+            """,
+            (prev_vendor, reason, f"Operan dari {prev_vendor}: {reason}", ticket_id)
+        )
+
+        await conn.execute(
+            """
+            INSERT INTO ticket_events (ticket_id, user_id, from_status, to_status, note)
+            VALUES (?, ?, ?, 'OPEN', ?)
+            """,
+            (ticket_id, user_id, prev_status, f"Operan dari {prev_vendor} ke INEO (Alasan: {reason})")
+        )
+
+        await conn.commit()
+
+    updated = await get_ticket_by_id(ticket_id)
+    return True, f"Tiket {updated['ticket_no']} berhasil dialihkan dari {prev_vendor} ke INEO.", updated
+
 async def get_ticket_events(ticket_id: int) -> List[dict]:
     async with get_db() as conn:
         cur = await conn.execute(
             """
-            SELECT te.*, u.full_name, u.username, u.role
+            SELECT te.*, u.full_name, u.username, u.role, u.vendor
             FROM ticket_events te
             LEFT JOIN users u ON te.user_id = u.user_id
             WHERE te.ticket_id = ?
@@ -303,80 +374,114 @@ async def get_ticket_events(ticket_id: int) -> List[dict]:
 
 # --- ANTRIAN & PENCARIAN ---
 
-async def get_open_tickets() -> List[dict]:
+async def get_open_tickets(vendor: Optional[str] = None) -> List[dict]:
     """
-    Get active tickets ordered by SLA deadline ascending (smallest remaining SLA first).
-    Status NOT IN ('CLOSED', 'CANCELLED').
+    Get active tickets ordered by SLA deadline ascending.
+    If vendor is specified ('DELTA' or 'INEO'), filters by vendor.
+    If vendor is None or 'ALL', returns all active tickets.
     """
     async with get_db() as conn:
-        cur = await conn.execute(
-            """
-            SELECT t.*, c.name as customer_name, c.partner_name, c.address, c.phone,
-                   n.region, n.olt, n.pon
-            FROM tickets t
-            JOIN customers c ON t.customer_id = c.customer_id
-            JOIN network_nodes n ON t.node_id = n.node_id
-            WHERE t.status NOT IN ('CLOSED', 'CANCELLED')
-            ORDER BY datetime(t.sla_deadline) ASC
-            """
-        )
+        if vendor and vendor != 'ALL':
+            cur = await conn.execute(
+                """
+                SELECT t.*, c.name as customer_name, c.partner_name, c.address, c.phone,
+                       n.region, n.olt, n.pon
+                FROM tickets t
+                JOIN customers c ON t.customer_id = c.customer_id
+                JOIN network_nodes n ON t.node_id = n.node_id
+                WHERE t.status NOT IN ('CLOSED', 'CANCELLED')
+                  AND t.vendor = ?
+                ORDER BY datetime(t.sla_deadline) ASC
+                """,
+                (vendor,)
+            )
+        else:
+            cur = await conn.execute(
+                """
+                SELECT t.*, c.name as customer_name, c.partner_name, c.address, c.phone,
+                       n.region, n.olt, n.pon
+                FROM tickets t
+                JOIN customers c ON t.customer_id = c.customer_id
+                JOIN network_nodes n ON t.node_id = n.node_id
+                WHERE t.status NOT IN ('CLOSED', 'CANCELLED')
+                ORDER BY datetime(t.sla_deadline) ASC
+                """
+            )
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
-async def search_tickets(keyword: str) -> List[dict]:
+async def search_tickets(keyword: str, vendor: Optional[str] = None) -> List[dict]:
     kw = f"%{keyword.strip()}%"
     async with get_db() as conn:
-        cur = await conn.execute(
-            """
-            SELECT t.*, c.name as customer_name, c.partner_name, n.olt, n.pon
-            FROM tickets t
-            JOIN customers c ON t.customer_id = c.customer_id
-            JOIN network_nodes n ON t.node_id = n.node_id
-            WHERE t.ticket_no LIKE ? OR t.crt_number LIKE ? OR c.name LIKE ?
-            ORDER BY datetime(t.fu_at) DESC
-            LIMIT 15
-            """,
-            (kw, kw, kw)
-        )
+        if vendor and vendor != 'ALL':
+            cur = await conn.execute(
+                """
+                SELECT t.*, c.name as customer_name, c.partner_name, n.olt, n.pon
+                FROM tickets t
+                JOIN customers c ON t.customer_id = c.customer_id
+                JOIN network_nodes n ON t.node_id = n.node_id
+                WHERE (t.ticket_no LIKE ? OR t.crt_number LIKE ? OR c.name LIKE ?)
+                  AND t.vendor = ?
+                ORDER BY datetime(t.fu_at) DESC
+                LIMIT 15
+                """,
+                (kw, kw, kw, vendor)
+            )
+        else:
+            cur = await conn.execute(
+                """
+                SELECT t.*, c.name as customer_name, c.partner_name, n.olt, n.pon
+                FROM tickets t
+                JOIN customers c ON t.customer_id = c.customer_id
+                JOIN network_nodes n ON t.node_id = n.node_id
+                WHERE t.ticket_no LIKE ? OR t.crt_number LIKE ? OR c.name LIKE ?
+                ORDER BY datetime(t.fu_at) DESC
+                LIMIT 15
+                """,
+                (kw, kw, kw)
+            )
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
 # --- REKAP LAPORAN ---
 
-async def get_tickets_for_report(target_date_str: str) -> List[dict]:
-    """
-    Target date string in YYYY-MM-DD.
-    Section 8 rules:
-    Tiket yang:
-    (a) masuk pada tanggal rekap (date(fu_at) = target_date),
-    (b) masih aktif dari hari sebelumnya (status NOT IN ('CLOSED', 'CANCELLED') AND date(fu_at) < target_date),
-    (c) ditutup atau dibatalkan pada tanggal rekap (date(closed_at) = target_date).
-    Urut berdasarkan waktu FU naik.
-    """
+async def get_tickets_for_report(target_date_str: str, vendor: Optional[str] = None) -> List[dict]:
     async with get_db() as conn:
-        cur = await conn.execute(
-            """
-            SELECT t.*, c.name as customer_name, c.partner_name, n.olt, n.pon
-            FROM tickets t
-            JOIN customers c ON t.customer_id = c.customer_id
-            JOIN network_nodes n ON t.node_id = n.node_id
-            WHERE (date(t.fu_at) = ?)
-               OR (t.status NOT IN ('CLOSED', 'CANCELLED') AND date(t.fu_at) < ?)
-               OR (t.status IN ('CLOSED', 'CANCELLED') AND date(t.closed_at) = ?)
-            ORDER BY datetime(t.fu_at) ASC
-            """,
-            (target_date_str, target_date_str, target_date_str)
-        )
+        if vendor and vendor != 'ALL':
+            cur = await conn.execute(
+                """
+                SELECT t.*, c.name as customer_name, c.partner_name, n.olt, n.pon
+                FROM tickets t
+                JOIN customers c ON t.customer_id = c.customer_id
+                JOIN network_nodes n ON t.node_id = n.node_id
+                WHERE ((date(t.fu_at) = ?)
+                   OR (t.status NOT IN ('CLOSED', 'CANCELLED') AND date(t.fu_at) < ?)
+                   OR (t.status IN ('CLOSED', 'CANCELLED') AND date(t.closed_at) = ?))
+                  AND t.vendor = ?
+                ORDER BY datetime(t.fu_at) ASC
+                """,
+                (target_date_str, target_date_str, target_date_str, vendor)
+            )
+        else:
+            cur = await conn.execute(
+                """
+                SELECT t.*, c.name as customer_name, c.partner_name, n.olt, n.pon
+                FROM tickets t
+                JOIN customers c ON t.customer_id = c.customer_id
+                JOIN network_nodes n ON t.node_id = n.node_id
+                WHERE (date(t.fu_at) = ?)
+                   OR (t.status NOT IN ('CLOSED', 'CANCELLED') AND date(t.fu_at) < ?)
+                   OR (t.status IN ('CLOSED', 'CANCELLED') AND date(t.closed_at) = ?)
+                ORDER BY datetime(t.fu_at) ASC
+                """,
+                (target_date_str, target_date_str, target_date_str)
+            )
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
 # --- SLA REMINDERS ---
 
 async def get_pending_reminders(reminder_type: str, minutes_before: int) -> List[dict]:
-    """
-    Finds active tickets whose sla_deadline is within minutes_before from now,
-    and has not been reminded with reminder_type yet.
-    """
     now = datetime.now(timezone.utc)
     async with get_db() as conn:
         cur = await conn.execute(

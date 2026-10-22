@@ -66,6 +66,7 @@ class TestFiberstarBot(unittest.TestCase):
         self.assertEqual(parsed.phone, "6281234567890")
         self.assertEqual(parsed.issue_type, "Los Merah")
         self.assertEqual(parsed.warranty_program, "Garansi delta")
+        self.assertEqual(parsed.vendor, "DELTA")
         self.assertEqual(parsed.olt, "PKU-OLT-01")
         self.assertEqual(parsed.pon, "1/1/4:12")
         self.assertTrue(parsed.to_dict()['is_valid'])
@@ -243,10 +244,42 @@ class TestAsyncDatabase(unittest.IsolatedAsyncioTestCase):
         crt_dict['sla_deadline'] = (now_dt + timedelta(hours=24)).isoformat()
         await insert_ticket(admin['user_id'], crt_dict)
 
-        from database.queries import get_active_tickets_by_crt
+        from database.queries import get_active_tickets_by_crt, transfer_ticket_to_ineo
         active_crt = await get_active_tickets_by_crt('CRT999999')
         self.assertEqual(len(active_crt), 1)
         self.assertEqual(active_crt[0]['ticket_no'], 'T8888888-211026-01')
+
+        # 9. Test ODP Lost transfer from DELTA to INEO
+        ticket_delta = await insert_ticket(admin['user_id'], {
+            'ticket_no': 'T7777777-221026-01',
+            'crt_number': 'CRT7777777',
+            'customer_name': 'Pelanggan Delta',
+            'issue_type': 'Los Merah',
+            'vendor': 'DELTA',
+            'status': 'OPEN',
+            'fu_at': now_dt.isoformat(),
+            'sla_deadline': (now_dt + timedelta(hours=24)).isoformat()
+        })
+        self.assertEqual(ticket_delta['vendor'], 'DELTA')
+
+        # DELTA queue should have it
+        delta_open = await get_open_tickets(vendor='DELTA')
+        delta_ticket_nos = [x['ticket_no'] for x in delta_open]
+        self.assertIn('T7777777-221026-01', delta_ticket_nos)
+
+        # Execute transfer ODP Lost
+        ok_tr, msg_tr, tr_ticket = await transfer_ticket_to_ineo(ticket_delta['ticket_id'], tech['user_id'], reason="ODP Lost")
+        self.assertTrue(ok_tr)
+        self.assertEqual(tr_ticket['vendor'], 'INEO')
+        self.assertEqual(tr_ticket['transferred_from'], 'DELTA')
+        self.assertEqual(tr_ticket['transfer_reason'], 'ODP Lost')
+
+        # Now ticket should NOT be in DELTA queue, but IN INEO queue!
+        delta_open_after = await get_open_tickets(vendor='DELTA')
+        self.assertNotIn('T7777777-221026-01', [x['ticket_no'] for x in delta_open_after])
+
+        ineo_open = await get_open_tickets(vendor='INEO')
+        self.assertIn('T7777777-221026-01', [x['ticket_no'] for x in ineo_open])
 
 if __name__ == '__main__':
     unittest.main()
