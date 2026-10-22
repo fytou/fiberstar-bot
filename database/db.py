@@ -115,7 +115,6 @@ CREATE INDEX IF NOT EXISTS idx_tickets_status_sla ON tickets(status, sla_deadlin
 CREATE INDEX IF NOT EXISTS idx_tickets_assigned_fu ON tickets(assigned_user_id, fu_at);
 CREATE INDEX IF NOT EXISTS idx_tickets_crt ON tickets(crt_number);
 CREATE INDEX IF NOT EXISTS idx_tickets_fu_at ON tickets(fu_at);
-CREATE INDEX IF NOT EXISTS idx_tickets_vendor ON tickets(vendor);
 """
 
 @asynccontextmanager
@@ -129,31 +128,63 @@ async def get_db():
         await conn.close()
 
 async def run_migrations(conn: aiosqlite.Connection):
-    """Safely adds missing columns to existing SQLite database without losing data."""
-    # Check users columns
-    cur = await conn.execute("PRAGMA table_info(users)")
-    user_cols = [row['name'] for row in await cur.fetchall()]
-    if 'vendor' not in user_cols:
-        await conn.execute("ALTER TABLE users ADD COLUMN vendor TEXT NOT NULL DEFAULT 'ALL'")
-        logger.info("Migrated users: added vendor column.")
+    """Safely updates existing SQLite schema without losing any data."""
+    # 1. Migrate users table if role CHECK constraint is missing SUPERADMIN
+    cur = await conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'")
+    row = await cur.fetchone()
+    if row and row['sql'] and "SUPERADMIN" not in row['sql']:
+        logger.info("Migrating users table to support SUPERADMIN role and vendor...")
+        await conn.execute("PRAGMA foreign_keys = OFF;")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users_new (
+                user_id INTEGER PRIMARY KEY,
+                team_id INTEGER NOT NULL REFERENCES teams(team_id),
+                username TEXT,
+                full_name TEXT,
+                role TEXT NOT NULL CHECK(role IN ('SUPERADMIN', 'ADMIN', 'SUPERVISOR', 'TEKNISI')),
+                vendor TEXT NOT NULL DEFAULT 'ALL' CHECK(vendor IN ('DELTA', 'INEO', 'ALL')),
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        # Copy data over
+        cur = await conn.execute("PRAGMA table_info(users)")
+        cols = [r['name'] for r in await cur.fetchall()]
+        has_vendor = 'vendor' in cols
+        if has_vendor:
+            await conn.execute("""
+                INSERT OR REPLACE INTO users_new (user_id, team_id, username, full_name, role, vendor, is_active, created_at)
+                SELECT user_id, team_id, username, full_name, role, vendor, is_active, created_at FROM users;
+            """)
+        else:
+            await conn.execute("""
+                INSERT OR REPLACE INTO users_new (user_id, team_id, username, full_name, role, vendor, is_active, created_at)
+                SELECT user_id, team_id, username, full_name, role, 'ALL', is_active, created_at FROM users;
+            """)
+        await conn.execute("DROP TABLE users;")
+        await conn.execute("ALTER TABLE users_new RENAME TO users;")
+        await conn.execute("PRAGMA foreign_keys = ON;")
+        logger.info("Users table migration completed successfully.")
 
-    # Check tickets columns
+    # 2. Migrate tickets table columns
     cur = await conn.execute("PRAGMA table_info(tickets)")
-    ticket_cols = [row['name'] for row in await cur.fetchall()]
-    if 'vendor' not in ticket_cols:
-        await conn.execute("ALTER TABLE tickets ADD COLUMN vendor TEXT NOT NULL DEFAULT 'DELTA'")
-        logger.info("Migrated tickets: added vendor column.")
-    if 'transferred_from' not in ticket_cols:
-        await conn.execute("ALTER TABLE tickets ADD COLUMN transferred_from TEXT")
-        logger.info("Migrated tickets: added transferred_from column.")
-    if 'transfer_reason' not in ticket_cols:
-        await conn.execute("ALTER TABLE tickets ADD COLUMN transfer_reason TEXT")
-        logger.info("Migrated tickets: added transfer_reason column.")
+    ticket_cols = [r['name'] for r in await cur.fetchall()]
+    if ticket_cols:
+        if 'vendor' not in ticket_cols:
+            await conn.execute("ALTER TABLE tickets ADD COLUMN vendor TEXT NOT NULL DEFAULT 'DELTA'")
+            logger.info("Migrated tickets: added vendor column.")
+        if 'transferred_from' not in ticket_cols:
+            await conn.execute("ALTER TABLE tickets ADD COLUMN transferred_from TEXT")
+            logger.info("Migrated tickets: added transferred_from column.")
+        if 'transfer_reason' not in ticket_cols:
+            await conn.execute("ALTER TABLE tickets ADD COLUMN transfer_reason TEXT")
+            logger.info("Migrated tickets: added transfer_reason column.")
 
 async def init_db():
     async with get_db() as conn:
         await conn.executescript(CREATE_TABLES_SQL)
         await run_migrations(conn)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tickets_vendor ON tickets(vendor);")
 
         # Ensure default team exists
         cur = await conn.execute("SELECT team_id FROM teams WHERE name = ?", (config.DEFAULT_TEAM_NAME,))
